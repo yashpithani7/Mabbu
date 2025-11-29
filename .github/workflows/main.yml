@@ -24,7 +24,7 @@ jobs:
         cargo install apkeep
 
     # -----------------------------------------------------------
-    # STEP 1 — Parse input list (supports comma, space, newline)
+    # STEP 1 — Parse input list (comma, semicolon, space, newline)
     # -----------------------------------------------------------
     - name: Normalize Input Into a List
       id: parse
@@ -42,40 +42,59 @@ jobs:
         cat apk_list.txt
 
     # -----------------------------------------------------------
-    # STEP 2 — Download ALL APKs first (apkeep only)
+    # STEP 2 — Download ALL APKs (supports URLs + apkeep)
     # -----------------------------------------------------------
-    - name: Download all APKs first (apkeep only)
+    - name: Download all APKs (URL or apkeep)
       id: fetch
       run: |
         mkdir -p apk
         mkdir -p downloaded
         mkdir -p failed
-        touch downloaded/list.txt
-        touch failed/list.txt
+        > downloaded/list.txt
+        > failed/list.txt
 
         n=0
         while IFS= read -r APK; do
           n=$((n+1))
           echo "==============================="
-          echo "Downloading target $n: $APK"
+          echo "Downloading target $n:"
+          echo "$APK"
           echo "==============================="
 
           mkdir -p "apk/$n"
 
-          # Try apkeep download
+          # --- URL Handling ------------------------------------
+          if [[ "$APK" =~ ^https?:// ]]; then
+            echo "Detected direct URL → using curl"
+
+            OUT="apk/$n/app_$n.apk"
+
+            # Follow redirects & fail on errors
+            if curl -L --fail -o "$OUT" "$APK"; then
+              echo "$APK:$OUT" >> downloaded/list.txt
+              echo "✔ Downloaded via URL: $OUT"
+            else
+              echo "❌ Download failed (URL): $APK"
+              echo "$APK" >> failed/list.txt
+            fi
+
+            continue
+          fi
+
+          # --- PACKAGED ID (apkeep) -----------------------------
+          echo "Using apkeep for package: $APK"
           apkeep -a "$APK" "apk/$n" -o 'arch=arm64-v8a' || true
 
-          # Check if APK exists
           FILE=$(ls "apk/$n"/*.apk 2>/dev/null || true)
 
           if [[ -z "$FILE" ]]; then
-            echo "❌ Download failed: $APK"
+            echo "❌ apkeep failed: $APK"
             echo "$APK" >> failed/list.txt
             continue
           fi
 
           echo "$APK:$FILE" >> downloaded/list.txt
-          echo "✔ Downloaded: $FILE"
+          echo "✔ apkeep downloaded: $FILE"
 
         done < apk_list.txt
 
@@ -127,14 +146,16 @@ jobs:
             -H "Content-Type: application/json" \
             -d "{\"scan_type\":\"apk\",\"file_name\":\"$(basename "$FILE")\",\"hash\":\"$HASH\"}"
 
-          # Reports
-          curl -o "results/${i}_${APK}.pdf" \
+          # Download Reports
+          SAFE_NAME=$(echo "$APK" | tr '/:?&=' '_' | tr -d '"')
+
+          curl -o "results/${i}_${SAFE_NAME}.pdf" \
             http://localhost:8000/api/v1/download_pdf \
             -H "Authorization: mobsf" \
             -H "Content-Type: application/json" \
             -d "{\"hash\":\"$HASH\"}"
 
-          curl -o "results/${i}_${APK}.json" \
+          curl -o "results/${i}_${SAFE_NAME}.json" \
             http://localhost:8000/api/v1/download_json \
             -H "Authorization: mobsf" \
             -H "Content-Type: application/json" \
