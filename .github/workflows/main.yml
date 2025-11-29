@@ -9,7 +9,7 @@ on:
         type: string
 
 jobs:
-  scan-apks:
+  mobsf-multi:
     runs-on: ubuntu-latest
 
     steps:
@@ -23,92 +23,148 @@ jobs:
         cargo --version || sudo apt install -y cargo
         cargo install apkeep
 
+    # -----------------------------------------------------------
+    # STEP 1 — Parse input list (supports comma, space, newline)
+    # -----------------------------------------------------------
     - name: Normalize Input Into a List
       id: parse
       run: |
         RAW="${{ github.event.inputs.apk_input }}"
 
-        # Replace commas with newlines, trim spaces
-        echo "$RAW" | tr ',' '\n' | sed 's/^[ \t]*//;s/[ \t]*$//' | sed '/^$/d' > apk_list.txt
+        echo "$RAW" \
+          | tr ',;，、' '\n' \
+          | tr ' ' '\n' \
+          | sed 's/^[ \t]*//;s/[ \t]*$//' \
+          | sed '/^$/d' \
+          > apk_list.txt
 
         echo "Parsed APK Targets:"
         cat apk_list.txt
 
+    # -----------------------------------------------------------
+    # STEP 2 — Download ALL APKs first (apkeep only)
+    # -----------------------------------------------------------
+    - name: Download all APKs first (apkeep only)
+      id: fetch
+      run: |
+        mkdir -p apk
+        mkdir -p downloaded
+        mkdir -p failed
+        touch downloaded/list.txt
+        touch failed/list.txt
+
+        n=0
+        while IFS= read -r APK; do
+          n=$((n+1))
+          echo "==============================="
+          echo "Downloading target $n: $APK"
+          echo "==============================="
+
+          mkdir -p "apk/$n"
+
+          # Try apkeep download
+          apkeep -a "$APK" "apk/$n" -o 'arch=arm64-v8a' || true
+
+          # Check if APK exists
+          FILE=$(ls "apk/$n"/*.apk 2>/dev/null || true)
+
+          if [[ -z "$FILE" ]]; then
+            echo "❌ Download failed: $APK"
+            echo "$APK" >> failed/list.txt
+            continue
+          fi
+
+          echo "$APK:$FILE" >> downloaded/list.txt
+          echo "✔ Downloaded: $FILE"
+
+        done < apk_list.txt
+
+        echo "done=true" >> $GITHUB_OUTPUT
+
+    # -----------------------------------------------------------
+    # STEP 3 — Start MobSF container AFTER download stage
+    # -----------------------------------------------------------
     - name: Start MobSF Container
+      if: steps.fetch.outputs.done == 'true'
       run: |
         docker pull opensecurity/mobile-security-framework-mobsf:latest
         docker run -d -p 8000:8000 --name mobsf \
           opensecurity/mobile-security-framework-mobsf:latest
         sleep 40
 
-    - name: Process All APKs
-      id: loop
+    # -----------------------------------------------------------
+    # STEP 4 — Scan only successfully downloaded APKs
+    # -----------------------------------------------------------
+    - name: Scan APKs with MobSF
+      id: scan
       run: |
         mkdir -p results
+        i=0
 
-        n=0
-        while IFS= read -r APK; do
-          n=$((n+1))
-          echo "Processing: $APK"
+        while IFS= read -r ENTRY; do
+          i=$((i+1))
 
-          mkdir -p "apk/$n"
+          APK=$(echo "$ENTRY" | cut -d':' -f1)
+          FILE=$(echo "$ENTRY" | cut -d':' -f2)
 
-          # Detect Input Type
-          if [[ "$APK" == http* ]]; then
-            echo "  → Detected URL"
-            wget -O "apk/$n/app.apk" "$APK"
-          else
-            echo "  → Detected Package ID"
-            apkeep -a "$APK" "apk/$n" -o 'arch=arm64-v8a'
-            mv "apk/$n"/*.apk "apk/$n/app.apk"
-          fi
+          echo "==============================="
+          echo "Scanning $i: $APK"
+          echo "==============================="
 
-          FILE="apk/$n/app.apk"
-
-          # Upload to MobSF
+          # Upload
           UPLOAD=$(curl -s -F "file=@$FILE" http://localhost:8000/api/v1/upload \
             -H "Authorization: mobsf")
           HASH=$(echo "$UPLOAD" | jq -r '.hash')
+
+          if [[ -z "$HASH" || "$HASH" == "null" ]]; then
+            echo "❌ MobSF upload failed: $APK"
+            continue
+          fi
 
           # Scan
           curl -s -X POST http://localhost:8000/api/v1/scan \
             -H "Authorization: mobsf" \
             -H "Content-Type: application/json" \
-            -d "{\"scan_type\":\"apk\",\"file_name\":\"app.apk\",\"hash\":\"$HASH\"}"
+            -d "{\"scan_type\":\"apk\",\"file_name\":\"$(basename "$FILE")\",\"hash\":\"$HASH\"}"
 
           # Reports
-          curl -o "results/report_$n.pdf" \
+          curl -o "results/${i}_${APK}.pdf" \
             http://localhost:8000/api/v1/download_pdf \
             -H "Authorization: mobsf" \
             -H "Content-Type: application/json" \
             -d "{\"hash\":\"$HASH\"}"
 
-          curl -o "results/report_$n.json" \
+          curl -o "results/${i}_${APK}.json" \
             http://localhost:8000/api/v1/download_json \
             -H "Authorization: mobsf" \
             -H "Content-Type: application/json" \
             -d "{\"hash\":\"$HASH\"}"
 
-          echo "Finished APK $n"
-        done < apk_list.txt
+          echo "✔ Finished: $APK"
+        done < downloaded/list.txt
 
-        echo "total=$n" >> $GITHUB_OUTPUT
+        echo "total=$i" >> $GITHUB_OUTPUT
 
-    - name: Send All Reports via Telegram
-      if: success()
+    # -----------------------------------------------------------
+    # STEP 5 — Send ALL reports via Telegram
+    # -----------------------------------------------------------
+    - name: Send reports to Telegram
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       run: |
-        TOTAL=${{ steps.loop.outputs.total }}
-        echo "Sending $TOTAL report sets to Telegram"
-
-        for i in $(seq 1 $TOTAL); do
+        for file in results/*; do
           curl -F chat_id="$TELEGRAM_CHAT_ID" \
-               -F document=@results/report_$i.pdf \
-               https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendDocument
-
-          curl -F chat_id="$TELEGRAM_CHAT_ID" \
-               -F document=@results/report_$i.json \
+               -F document=@"$file" \
                https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendDocument
         done
+
+    # -----------------------------------------------------------
+    # OPTIONAL — Print failed APK list
+    # -----------------------------------------------------------
+    - name: Show failed APK downloads
+      run: |
+        echo "====================================="
+        echo "APK DOWNLOADS THAT FAILED:"
+        echo "====================================="
+        cat failed/list.txt || true
