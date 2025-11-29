@@ -1,0 +1,114 @@
+name: Mobile App Security Scan (MobSF Multi)
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_input:
+        description: "APK URLs or Package Identifiers (comma, space, or newline separated)"
+        required: true
+        type: string
+
+jobs:
+  scan-apks:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repo
+      uses: actions/checkout@v4
+
+    - name: Install Dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y python3 python3-pip curl jq unzip
+        cargo --version || sudo apt install -y cargo
+        cargo install apkeep
+
+    - name: Normalize Input Into a List
+      id: parse
+      run: |
+        RAW="${{ github.event.inputs.apk_input }}"
+
+        # Replace commas with newlines, trim spaces
+        echo "$RAW" | tr ',' '\n' | sed 's/^[ \t]*//;s/[ \t]*$//' | sed '/^$/d' > apk_list.txt
+
+        echo "Parsed APK Targets:"
+        cat apk_list.txt
+
+    - name: Start MobSF Container
+      run: |
+        docker pull opensecurity/mobile-security-framework-mobsf:latest
+        docker run -d -p 8000:8000 --name mobsf \
+          opensecurity/mobile-security-framework-mobsf:latest
+        sleep 40
+
+    - name: Process All APKs
+      id: loop
+      run: |
+        mkdir -p results
+
+        n=0
+        while IFS= read -r APK; do
+          n=$((n+1))
+          echo "Processing: $APK"
+
+          mkdir -p "apk/$n"
+
+          # Detect Input Type
+          if [[ "$APK" == http* ]]; then
+            echo "  → Detected URL"
+            wget -O "apk/$n/app.apk" "$APK"
+          else
+            echo "  → Detected Package ID"
+            apkeep -a "$APK" "apk/$n" -o 'arch=arm64-v8a'
+            mv "apk/$n"/*.apk "apk/$n/app.apk"
+          fi
+
+          FILE="apk/$n/app.apk"
+
+          # Upload to MobSF
+          UPLOAD=$(curl -s -F "file=@$FILE" http://localhost:8000/api/v1/upload \
+            -H "Authorization: mobsf")
+          HASH=$(echo "$UPLOAD" | jq -r '.hash')
+
+          # Scan
+          curl -s -X POST http://localhost:8000/api/v1/scan \
+            -H "Authorization: mobsf" \
+            -H "Content-Type: application/json" \
+            -d "{\"scan_type\":\"apk\",\"file_name\":\"app.apk\",\"hash\":\"$HASH\"}"
+
+          # Reports
+          curl -o "results/report_$n.pdf" \
+            http://localhost:8000/api/v1/download_pdf \
+            -H "Authorization: mobsf" \
+            -H "Content-Type: application/json" \
+            -d "{\"hash\":\"$HASH\"}"
+
+          curl -o "results/report_$n.json" \
+            http://localhost:8000/api/v1/download_json \
+            -H "Authorization: mobsf" \
+            -H "Content-Type: application/json" \
+            -d "{\"hash\":\"$HASH\"}"
+
+          echo "Finished APK $n"
+        done < apk_list.txt
+
+        echo "total=$n" >> $GITHUB_OUTPUT
+
+    - name: Send All Reports via Telegram
+      if: success()
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: |
+        TOTAL=${{ steps.loop.outputs.total }}
+        echo "Sending $TOTAL report sets to Telegram"
+
+        for i in $(seq 1 $TOTAL); do
+          curl -F chat_id="$TELEGRAM_CHAT_ID" \
+               -F document=@results/report_$i.pdf \
+               https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendDocument
+
+          curl -F chat_id="$TELEGRAM_CHAT_ID" \
+               -F document=@results/report_$i.json \
+               https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendDocument
+        done
